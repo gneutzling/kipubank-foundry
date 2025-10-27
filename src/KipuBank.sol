@@ -2,7 +2,7 @@
 pragma solidity 0.8.30;
 
 /**
- * @title KipuBankV3
+ * @title KipuBank
  * @notice Educational DeFi vault that:
  *  - accepts arbitrary ERC20 (and ETH),
  *  - swaps them to USDC using Uniswap (Universal Router),
@@ -42,7 +42,7 @@ interface IPermit2 {
     // we'll add exact function sigs we need later
 }
 
-contract KipuBankV3 is AccessControl {
+contract KipuBank is AccessControl {
     using SafeERC20 for IERC20;
 
     // ========= Roles =========
@@ -115,21 +115,29 @@ contract KipuBankV3 is AccessControl {
     // ========= Modifiers =========
 
     modifier noReentrancy() {
+        _noReentrancyBefore();
+        _;
+        _noReentrancyAfter();
+    }
+
+    function _noReentrancyBefore() internal {
         if (locked) revert ReentrancyDetected();
         locked = true;
-        _;
+    }
+
+    function _noReentrancyAfter() internal {
         locked = false;
     }
 
     // ========= Constructor =========
 
     constructor(
-        address _usdc,
-        uint256 _bankCapUsdc, // cap in 6-decimal USDC units
-        address _universalRouter,
-        address _permit2,
-        address _ethUsdPriceFeed,
-        address _admin // gets DEFAULT_ADMIN_ROLE and MANAGER_ROLE
+        address _usdc, // address of the USDC token on the target network
+        uint256 _bankCapUsdc, // global AUM cap in USDC units (6 decimals)
+        address _universalRouter, // Uniswap UniversalRouter address on this network
+        address _permit2, // Uniswap Permit2 address on this network
+        address _ethUsdPriceFeed, // Chainlink ETH/USD feed (for legacy compatibility / owner logic)
+        address _admin // initial admin/manager (bank owner)
     ) {
         if (
             _usdc == address(0) ||
@@ -194,16 +202,32 @@ contract KipuBankV3 is AccessControl {
         bytes calldata routerCommands,
         bytes[] calldata routerInputs
     ) external noReentrancy {
-        // implementation will come in next step
-        // we'll:
-        // 1. require(amountIn > 0)
-        // 2. pull tokenIn from msg.sender (via SafeERC20 for now)
-        // 3. if tokenIn != address(USDC), run universalRouter.execute(...)
-        // 4. measure how much USDC arrived (must be >= minUsdcOut)
-        // 5. _enforceBankCap(usdcReceived)
-        // 6. balances[msg.sender] += usdcReceived
-        // 7. emit DepositedUSDC(...)
-        // 8. depositCount++
+        if (amountIn == 0) revert ZeroAmountNotAllowed();
+        if (tokenIn == address(0)) revert ZeroAddressNotAllowed();
+
+        // 1. pull the user's tokens into THIS contract
+        _pullTokenFromUser(tokenIn, msg.sender, amountIn);
+
+        // 2. perform swap (or just treat as USDC if already USDC)
+        uint256 usdcReceived = _swapExactInputSingle(
+            tokenIn,
+            amountIn,
+            minUsdcOut,
+            routerCommands,
+            routerInputs
+        );
+
+        // 3. enforce vault cap BEFORE crediting
+        _enforceBankCap(usdcReceived);
+
+        // 4. credit internal accounting
+        balances[msg.sender] += usdcReceived;
+
+        // 5. bookkeeping
+        depositCount++;
+
+        // 6. event
+        emit DepositedUSDC(msg.sender, tokenIn, amountIn, usdcReceived);
     }
 
     /**
@@ -256,5 +280,92 @@ contract KipuBankV3 is AccessControl {
         if (projected > BANK_CAP) {
             revert BankCapacityExceeded(current, incomingUsdc, BANK_CAP);
         }
+    }
+
+    /**
+     * @dev Pulls `amount` of `token` from `from` into this contract.
+     * Uses SafeERC20 for safety. Caller must have approved beforehand.
+     *
+     * NOTE: For final version we may extend this to support Permit2
+     * so the user can sign instead of calling approve().
+     */
+    function _pullTokenFromUser(
+        address token,
+        address from,
+        uint256 amount
+    ) internal {
+        if (token == address(0)) revert ZeroAddressNotAllowed();
+        IERC20(token).safeTransferFrom(from, address(this), amount);
+    }
+
+    /**
+     * @dev Swaps `amountIn` of `tokenIn` (already held by this contract)
+     *      into USDC using the Universal Router.
+     *
+     * The Uniswap V4 routing data is provided via `routerCommands` and
+     * `routerInputs`. These are the encoded "program" that the UniversalRouter
+     * executes. In practice, off-chain code builds these using Uniswap V4 types:
+     *
+     *  - PoolKey: identifies the V4 pool (token0, token1, fee tier, hooks, etc)
+     *  - Currency: wrapper type used by V4 to represent ERC20 / native assets
+     *  - Commands / Actions: byte-level opcodes telling the router which action
+     *    to perform (e.g. swap exact in, sweep token, etc)
+     *
+     * The expectation is:
+     *  - UniversalRouter pulls `tokenIn` from this contract,
+     *  - performs a swap along the specified PoolKey(s),
+     *  - and sends the output (USDC) back to this contract.
+     *
+     * Security notes:
+     *  - We approve only `amountIn` to the router and clear allowance first.
+     *  - Caller provides `minUsdcOut` as slippage protection.
+     *  - We do not leave infinite approvals behind.
+     *
+     * Returns how much USDC was actually received.
+     */
+
+    function _swapExactInputSingle(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minUsdcOut,
+        bytes calldata routerCommands,
+        bytes[] calldata routerInputs
+    ) internal returns (uint256 usdcReceived) {
+        // snapshot how much USDC we had before
+        uint256 balanceBefore = USDC.balanceOf(address(this));
+
+        if (tokenIn == address(USDC)) {
+            // no swap needed, we already hold USDC
+            usdcReceived = amountIn;
+        } else {
+            IERC20 token = IERC20(tokenIn);
+
+            // reset allowance for safety, then approve router
+            // We do manual approve here instead of SafeERC20.safeApprove(),
+            // because newer OZ versions removed safeApprove.
+            require(
+                token.approve(address(UNIVERSAL_ROUTER), 0),
+                "approve reset failed"
+            );
+
+            require(
+                token.approve(address(UNIVERSAL_ROUTER), amountIn),
+                "approve failed"
+            );
+
+            // execute the encoded Uniswap V4 route
+            UNIVERSAL_ROUTER.execute(routerCommands, routerInputs);
+
+            // calculate how much USDC we actually gained
+            uint256 balanceAfter = USDC.balanceOf(address(this));
+            usdcReceived = balanceAfter - balanceBefore;
+        }
+
+        // basic slippage protection: require minimum USDC
+        if (usdcReceived < minUsdcOut) {
+            revert("slippage");
+        }
+
+        return usdcReceived;
     }
 }
