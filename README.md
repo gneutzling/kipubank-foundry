@@ -1,66 +1,176 @@
-## Foundry
+# 🏦 KipuBank V3
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+**KipuBank V3** is a Solidity smart contract that acts as a USDC-based vault.
+It accepts ETH or ERC20 tokens, swaps them to USDC via Uniswap’s **Universal Router**,
+and keeps all user balances in USDC. It also enforces a global **bank cap** in USDC and supports **Permit2 deposits** (no need to call `approve`).
 
-Foundry consists of:
+---
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+## ✨ Key Features
 
-## Documentation
+### 🪙 Unified USDC Accounting
 
-https://book.getfoundry.sh/
+- All deposits are converted and credited as **USDC** (6 decimals).
+- Withdrawals are always done in USDC.
 
-## Usage
+### ⚙️ Universal Router Integration
 
-### Build
+- Swaps any ERC20 or ETH → USDC using Uniswap’s **Universal Router**.
+- The route (`commands` and `inputs`) is provided by the caller or frontend.
 
-```shell
-$ forge build
+### 💰 Bank Cap (AUM Limit)
+
+- Enforces a maximum total USDC balance (`BANK_CAP`).
+- Prevents the vault from holding more than allowed.
+
+### 🪄 Permit2 Integration
+
+- Users can deposit ERC20 tokens without calling `approve`.
+- Uses Uniswap’s **Permit2** for signature-based token pulls.
+- Improves UX and avoids infinite token approvals.
+
+### 🔐 Security Controls
+
+- **Reentrancy guard**: prevents reentrancy attacks.
+- **Scoped approvals**: approvals are set per swap, never infinite.
+- **Slippage & deadline**: prevents stale or unfair swaps.
+- **ETH alias** (`0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`) standard for native deposits.
+- **Role-based control**: manager can recover balances.
+
+### 📈 Oracle Integration
+
+- Uses **Chainlink ETH/USD feed** for price visibility (same as V2).
+- Keeps backward compatibility and transparency.
+
+---
+
+## 🚀 How It Works
+
+### 1. Deposit Flow
+
+#### 🪙 ERC20 Deposit
+
+1. Approve the vault (or use Permit2).
+2. Call `depositArbitraryToken(tokenIn, amountIn, minUsdcOut, deadline, commands, inputs)`.
+3. Contract:
+
+   - Pulls the token.
+   - Swaps to USDC via Universal Router.
+   - Checks bank cap.
+   - Credits USDC to the sender.
+
+#### 💧 ETH Deposit
+
+1. Call `depositArbitraryToken(ETH_ALIAS, amount, minUsdcOut, deadline, commands, inputs)`.
+2. Send the same `msg.value` as `amount`.
+3. Router wraps ETH to WETH and swaps to USDC.
+
+#### 🪄 Permit2 Deposit
+
+1. User signs a Permit2 approval.
+2. Call `depositWithPermit2(token, amount, permitData, ...)`.
+3. Contract pulls tokens via Permit2 and performs the same flow.
+
+---
+
+### 2. Withdraw
+
+Call:
+
+```solidity
+withdrawUsdc(amount)
 ```
 
-### Test
+- Decreases the user’s internal balance.
+- Sends USDC back to the wallet.
 
-```shell
-$ forge test
+---
+
+### 3. Admin
+
+**Manager role** can:
+
+```solidity
+recoverFunds(user, newBalance)
 ```
 
-### Format
+Used for emergency balance corrections.
 
-```shell
-$ forge fmt
-```
+---
 
-### Gas Snapshots
+## 📊 Constructor Params
 
-```shell
-$ forge snapshot
-```
+| Parameter          | Description                      |
+| ------------------ | -------------------------------- |
+| `_usdc`            | USDC token address               |
+| `_bankCapUsdc`     | Vault cap (in USDC, 6 decimals)  |
+| `_universalRouter` | Uniswap Universal Router address |
+| `_permit2`         | Permit2 contract address         |
+| `_ethUsdPriceFeed` | Chainlink ETH/USD feed address   |
+| `_admin`           | Initial admin/manager            |
 
-### Anvil
+---
 
-```shell
-$ anvil
-```
+## 🧠 Example Workflow
 
-### Deploy
+1. **Deploy** KipuBank V3 with constructor params.
+2. **Deposit ETH**:
 
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
+   ```solidity
 
-### Cast
+   ```
 
-```shell
-$ cast <subcommand>
-```
+depositArbitraryToken(ETH_ALIAS, 1 ether, 900 \* 1e6, deadline, commands, inputs);
 
-### Help
+````
+3. **Deposit ERC20**:
+```solidity
+depositArbitraryToken(tokenAddress, amountIn, minUsdcOut, deadline, commands, inputs);
+````
 
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+4. **Withdraw USDC**:
+
+   ```solidity
+
+   ```
+
+withdrawUsdc(100_000_000); // 100 USDC
+
+````
+5. **Check Price Feed**:
+```solidity
+getEthUsdPrice();
+````
+
+---
+
+## 🧰 Tech Stack
+
+- **Solidity 0.8.30**
+- **OpenZeppelin**: `AccessControl`, `SafeERC20`
+- **Chainlink**: ETH/USD feed
+- **Uniswap**: Universal Router + Permit2
+- **Foundry**: for compilation, testing, and deployment
+
+---
+
+## ⚖️ Security & Design Highlights
+
+- No direct ETH transfers (must call via function).
+- No infinite allowances.
+- Reentrancy guard on all external functions.
+- BANK_CAP enforced per deposit.
+- CEI pattern everywhere.
+
+---
+
+## 🧾 Summary
+
+KipuBank V3 is a **USDC-denominated vault** that brings together:
+
+- Token and ETH deposits → auto-swapped to USDC.
+- Controlled AUM via `BANK_CAP`.
+- Safe deposits via Permit2 or classic approval.
+- Fully audited-style architecture with Uniswap + Chainlink integration.
+
+> Simple, composable, and secure — a DeFi vault with guardrails.
