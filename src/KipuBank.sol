@@ -3,83 +3,107 @@ pragma solidity 0.8.30;
 
 /**
  * @title KipuBank
- * @notice Educational DeFi vault that:
- *  - accepts arbitrary ERC20 (and ETH),
- *  - swaps them to USDC using Uniswap (Universal Router),
- *  - credits user balances in USDC,
- *  - and enforces a global bank cap in USDC.
+ * @notice USDC-denominated vault with on-chain token routing and AUM limits.
  *
- * High-level goals:
- *  - Users always end up with a USDC-denominated balance.
- *  - The bank never holds more than BANK_CAP USDC (AUM limit).
- *  - Owner/manager can still recover balances if needed.
+ * Core properties:
+ *  - Accepts arbitrary ERC20 tokens and native ETH.
+ *  - Swaps all inbound assets into USDC via Uniswap's Universal Router.
+ *  - Credits users internally in USDC units (6 decimals).
+ *  - Enforces a global bank cap (BANK_CAP) measured in USDC.
+ *  - Exposes a Chainlink ETH/USD oracle for observability and continuity with KipuBankV2.
+ *  - Provides both an "ERC20 approval" deposit path and a "Permit2 signature" deposit path.
  *
- * Important:
- *  - All internal accounting is in USDC (6 decimals).
- *  - Bank cap is defined in USDC units.
- *  - We keep a Chainlink price feed reference to satisfy the "preserve V2 functionality"
- *    requirement, although withdrawals are simplified to USDC only.
+ * Security posture:
+ *  - Bank cap prevents uncontrolled TVL growth.
+ *  - Slippage + deadline guard swaps.
+ *  - No infinite approvals: allowances to the router are scoped per-call.
+ *  - Reentrancy guard on all state-mutating external entrypoints.
+ *  - AccessControl-based owner/manager role for recovery.
+ *
+ * This contract is educational in nature but follows production-lean patterns.
  */
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "openzeppelin-contracts/contracts/access/AccessControl.sol";
 
-// Chainlink price feed interface (kept for spec continuity)
 import {AggregatorV3Interface} from "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-// Uniswap V4-style router interface placeholder.
-// We'll refine the interface when we wire swap logic.
+/// @notice Minimal Universal Router interface.
+/// The Universal Router is expected to:
+///  - pull approved tokens from this contract,
+///  - execute an encoded sequence of swap / wrap / sweep commands,
+///  - send the resulting USDC back to this contract.
 interface IUniversalRouter {
     function execute(
         bytes calldata commands,
-        bytes[] calldata inputs
+        bytes[] calldata inputs,
+        uint256 deadline
     ) external payable;
 }
 
-// Permit2 placeholder interface (will be filled when we actually use it)
+/// @notice Minimal Permit2 interface subset.
+/// Permit2 lets a user authorize token spending via an off-chain signature,
+/// instead of first issuing a direct `approve` to this contract.
+///
+/// NOTE: This is a pedagogical subset. The real Permit2 contract uses
+/// structured data (PermitTransferFrom) with nonce management. For the
+/// purposes of this exercise and clarity of integration, we model the
+/// essential "pull with a signed permit" behavior.
 interface IPermit2 {
-    // we'll add exact function sigs we need later
+    function permitTransferFrom(
+        address owner,
+        address token,
+        uint256 amount,
+        address to,
+        uint256 permitDeadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
 }
 
 contract KipuBank is AccessControl {
     using SafeERC20 for IERC20;
 
     // ========= Roles =========
+
+    /// @dev Manager role can perform administrative recovery.
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
-    // We still expose an ETH alias for deposits of native ETH.
+    /// @dev Sentinel address used to represent native ETH in user-facing calls.
+    ///      Matches the common 0xEeee... convention.
     address public constant ETH_ALIAS =
         0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
-    // ========= Immutable Config =========
+    // ========= Immutable Configuration =========
 
-    // The single asset we account in (USDC, 6 decimals expected).
+    /// @notice USDC-like asset used for accounting (assumed 6 decimals).
     IERC20 public immutable USDC;
 
-    // Max total USDC the vault is allowed to custody.
+    /// @notice Upper bound on total assets under management, in USDC units (6 decimals).
     uint256 public immutable BANK_CAP;
 
-    // Uniswap's universal router to perform swaps from arbitrary tokens -> USDC.
+    /// @notice Uniswap Universal Router used for swaps.
     IUniversalRouter public immutable UNIVERSAL_ROUTER;
 
-    // Permit2 contract (gas-efficient approvals / pull funds).
+    /// @notice Uniswap Permit2 contract used for signature-based deposits.
     IPermit2 public immutable PERMIT2;
 
-    // Chainlink ETH/USD feed (kept for legacy compatibility with V2 requirements).
+    /// @notice Chainlink ETH/USD feed for observability / continuity with V2.
     AggregatorV3Interface public immutable ETH_USD_PRICE_FEED;
 
     // ========= State =========
 
-    // User balances, always denominated in USDC.
-    // In V2 it was balances[user][token]; V3 simplifies to only USDC.
+    /// @dev Internal ledger: user => credited USDC balance (6 decimals).
+    ///      KipuBankV2 tracked balances per token; KipuBank consolidates to USDC only.
     mapping(address => uint256) public balances;
 
-    // simple counters for telemetry / auditability
+    /// @dev Simple telemetry / audit counters.
     uint256 public depositCount;
     uint256 public withdrawCount;
 
-    // basic reentrancy guard
+    /// @dev Reentrancy guard flag.
     bool private locked;
 
     // ========= Events =========
@@ -99,7 +123,7 @@ contract KipuBank is AccessControl {
         uint256 newBalanceUsdc
     );
 
-    // ========= Errors =========
+    // ========= Custom Errors =========
 
     error ZeroAmountNotAllowed();
     error BankCapacityExceeded(
@@ -111,6 +135,8 @@ contract KipuBank is AccessControl {
     error ReentrancyDetected();
     error ZeroAddressNotAllowed();
     error ZeroBankCapNotAllowed();
+    error InsufficientSwapOutput(uint256 expected, uint256 received);
+    error EthValueMismatch(uint256 declared, uint256 actual);
 
     // ========= Modifiers =========
 
@@ -131,13 +157,21 @@ contract KipuBank is AccessControl {
 
     // ========= Constructor =========
 
+    /**
+     * @param _usdc              Address of the USDC token on the target network
+     * @param _bankCapUsdc       Global TVL cap, denominated in USDC units (6 decimals)
+     * @param _universalRouter   Deployed Universal Router address (Uniswap)
+     * @param _permit2           Deployed Permit2 address (Uniswap)
+     * @param _ethUsdPriceFeed   Chainlink ETH/USD price feed address
+     * @param _admin             Admin/manager address that will receive DEFAULT_ADMIN_ROLE and MANAGER_ROLE
+     */
     constructor(
-        address _usdc, // address of the USDC token on the target network
-        uint256 _bankCapUsdc, // global AUM cap in USDC units (6 decimals)
-        address _universalRouter, // Uniswap UniversalRouter address on this network
-        address _permit2, // Uniswap Permit2 address on this network
-        address _ethUsdPriceFeed, // Chainlink ETH/USD feed (for legacy compatibility / owner logic)
-        address _admin // initial admin/manager (bank owner)
+        address _usdc,
+        uint256 _bankCapUsdc,
+        address _universalRouter,
+        address _permit2,
+        address _ethUsdPriceFeed,
+        address _admin
     ) {
         if (
             _usdc == address(0) ||
@@ -159,79 +193,252 @@ contract KipuBank is AccessControl {
         _grantRole(MANAGER_ROLE, _admin);
     }
 
-    // ========= Views =========
+    // ========= View Functions =========
 
-    /// @notice Total USDC actually held by the contract.
+    /// @notice Total USDC currently custodied by the vault.
     function totalUsdcInVault() public view returns (uint256) {
         return USDC.balanceOf(address(this));
     }
 
-    /// @notice USDC balance credited to a specific user.
+    /// @notice User's internal USDC-denominated balance (6 decimals).
     function balanceOfUsdc(address user) external view returns (uint256) {
         return balances[user];
     }
 
-    /// @notice How much room (in USDC units) is left before hitting BANK_CAP.
+    /// @notice Remaining capacity before hitting the global BANK_CAP.
     function remainingCapacityUsdc() external view returns (uint256) {
         uint256 current = USDC.balanceOf(address(this));
         return current >= BANK_CAP ? 0 : (BANK_CAP - current);
     }
 
-    // ========= Core external functions (to implement next) =========
+    /// @notice Exposes latest ETH/USD price info from Chainlink.
+    /// @dev KipuBankV2 exposed oracle data; we maintain that observability here.
+    function getEthUsdPrice()
+        external
+        view
+        returns (int256 price, uint8 decimals)
+    {
+        (, int256 answer, , , ) = ETH_USD_PRICE_FEED.latestRoundData();
+
+        return (answer, ETH_USD_PRICE_FEED.decimals());
+    }
+
+    // ========= Deposit Flows =========
+    //
+    // We support two ways to deposit assets:
+    //
+    // 1. depositArbitraryToken (classic flow)
+    //    - User first does ERC20.approve(KipuBank, amountIn).
+    //    - We pull the tokens via safeTransferFrom.
+    //
+    // 2. depositWithPermit2 (signature-based flow)
+    //    - User signs an off-chain Permit2 approval.
+    //    - We execute that permit and pull the tokens in the same tx.
+    //
+    // Both paths:
+    //  - Optionally swap tokenIn -> USDC via Universal Router.
+    //  - Enforce BANK_CAP.
+    //  - Credit caller's balance in USDC.
+    //  - Slippage-protect and deadline-bound the swap.
 
     /**
-     * @notice Deposit any supported token.
+     * @notice Deposit any supported asset (ERC20 or native ETH), get USDC credit.
      *
-     * If tokenIn == USDC:
-     *   - pull USDC directly from sender
-     *   - enforce BANK_CAP
-     *   - credit balances[sender]
+     * tokenIn cases:
      *
-     * Else:
-     *   - pull tokenIn
-     *   - swap -> USDC via universalRouter
-     *   - enforce BANK_CAP
-     *   - credit balances[sender]
+     *  - tokenIn == address(USDC):
+     *      We simply pull USDC and credit it 1:1.
      *
-     * @dev minUsdcOut is slippage protection.
+     *  - tokenIn == ETH_ALIAS (0xEeee...EEeE):
+     *      Caller must send native ETH in msg.value.
+     *      UniversalRouter is invoked with that ETH to perform:
+     *        WRAP_ETH -> SWAP_EXACT_IN -> USDC
+     *
+     *  - otherwise (any ERC20):
+     *      Caller must have approved this contract to spend `amountIn`.
+     *      We pull tokenIn via safeTransferFrom().
+     *      We then swap tokenIn -> USDC through UniversalRouter using a
+     *      scoped allowance (zero-then-set).
+     *
+     * After the swap (or direct credit if already USDC), we:
+     *  - enforce BANK_CAP,
+     *  - apply slippage checks,
+     *  - update the user's USDC-denominated balance.
+     *
+     * @param tokenIn         Asset to deposit (USDC, ETH_ALIAS, or any ERC20).
+     * @param amountIn        Amount of that asset.
+     *                        For ETH_ALIAS deposits, must equal msg.value.
+     * @param minUsdcOut      Minimum USDC the user is willing to receive (slippage guard).
+     * @param deadline        Swap deadline. The router must execute before this timestamp.
+     * @param routerCommands  Encoded UniversalRouter command sequence.
+     *                        Off-chain build using Uniswap V4 types (PoolKey, Currency, etc).
+     * @param routerInputs    Per-command ABI-encoded arguments consumed by each command.
      */
     function depositArbitraryToken(
         address tokenIn,
         uint256 amountIn,
         uint256 minUsdcOut,
+        uint256 deadline,
         bytes calldata routerCommands,
         bytes[] calldata routerInputs
-    ) external noReentrancy {
+    ) external payable noReentrancy {
         if (amountIn == 0) revert ZeroAmountNotAllowed();
-        if (tokenIn == address(0)) revert ZeroAddressNotAllowed();
 
-        // 1. pull the user's tokens into THIS contract
-        _pullTokenFromUser(tokenIn, msg.sender, amountIn);
+        uint256 usdcReceived;
+        address actualTokenIn = tokenIn;
 
-        // 2. perform swap (or just treat as USDC if already USDC)
-        uint256 usdcReceived = _swapExactInputSingle(
-            tokenIn,
-            amountIn,
-            minUsdcOut,
-            routerCommands,
-            routerInputs
-        );
+        // 1. Native ETH path
+        if (tokenIn == ETH_ALIAS) {
+            // Require correct msg.value to avoid "phantom" deposits.
+            if (msg.value != amountIn) {
+                revert EthValueMismatch(amountIn, msg.value);
+            }
 
-        // 3. enforce vault cap BEFORE crediting
+            uint256 balanceBefore = USDC.balanceOf(address(this));
+
+            // Router executes provided commands with msg.value as input liquidity.
+            // Off-chain supplied route should: wrap ETH -> swap to USDC -> return to this contract.
+            UNIVERSAL_ROUTER.execute{value: amountIn}(
+                routerCommands,
+                routerInputs,
+                deadline
+            );
+
+            uint256 balanceAfter = USDC.balanceOf(address(this));
+            usdcReceived = balanceAfter - balanceBefore;
+
+            // 2. Direct USDC path (no swap, just custody)
+        } else if (tokenIn == address(USDC)) {
+            _pullTokenFromUser(tokenIn, msg.sender, amountIn);
+            usdcReceived = amountIn;
+
+            // 3. Arbitrary ERC20 path
+        } else if (tokenIn != address(0)) {
+            _pullTokenFromUser(tokenIn, msg.sender, amountIn);
+
+            usdcReceived = _swapExactInputSingle(
+                tokenIn,
+                amountIn,
+                deadline,
+                routerCommands,
+                routerInputs
+            );
+        } else {
+            revert ZeroAddressNotAllowed();
+        }
+
+        // Slippage check for routes that involved swapping.
+        if (actualTokenIn != address(USDC) && usdcReceived < minUsdcOut) {
+            revert InsufficientSwapOutput(minUsdcOut, usdcReceived);
+        }
+
+        // Enforce TVL cap BEFORE updating internal balances.
         _enforceBankCap(usdcReceived);
 
-        // 4. credit internal accounting
+        // Credit user's internal ledger.
         balances[msg.sender] += usdcReceived;
 
-        // 5. bookkeeping
         depositCount++;
 
-        // 6. event
-        emit DepositedUSDC(msg.sender, tokenIn, amountIn, usdcReceived);
+        emit DepositedUSDC(msg.sender, actualTokenIn, amountIn, usdcReceived);
     }
 
     /**
-     * @notice Withdraw USDC.
+     * @notice Deposit using Uniswap Permit2 instead of caller-side ERC20.approve().
+     *
+     * This path improves UX and safety:
+     *  - The user signs an off-chain Permit2 authorization that says
+     *    "KipuBank can pull up to amountIn of tokenIn until deadline".
+     *  - We submit that signature here in the same tx.
+     *  - Permit2 moves `amountIn` of `tokenIn` from the caller directly
+     *    into this contract.
+     *
+     * After we custody `tokenIn`, we follow the same flow as depositArbitraryToken():
+     *  - If tokenIn is USDC: credit directly.
+     *  - Else: swap tokenIn -> USDC through UniversalRouter.
+     *  - Enforce BANK_CAP.
+     *  - Check slippage.
+     *
+     * NOTE:
+     *  - This function does NOT handle native ETH. ETH deposits should go
+     *    through depositArbitraryToken using ETH_ALIAS + msg.value.
+     *  - This uses a simplified Permit2 interface for educational clarity.
+     *
+     * @param tokenIn         ERC20 token address being deposited (not ETH_ALIAS).
+     * @param amountIn        Amount of tokenIn authorized by the Permit2 signature.
+     * @param minUsdcOut      Minimum USDC the user is willing to receive.
+     * @param deadline        Both:
+     *                        - The Permit2 permit expiry,
+     *                        - And the Universal Router swap deadline.
+     * @param routerCommands  Encoded UniversalRouter command sequence.
+     * @param routerInputs    Per-command ABI-encoded router inputs.
+     * @param v               ECDSA sig v (from user's permit).
+     * @param r               ECDSA sig r (from user's permit).
+     * @param s               ECDSA sig s (from user's permit).
+     */
+    function depositWithPermit2(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minUsdcOut,
+        uint256 deadline,
+        bytes calldata routerCommands,
+        bytes[] calldata routerInputs,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external noReentrancy {
+        if (amountIn == 0) revert ZeroAmountNotAllowed();
+        if (tokenIn == address(0) || tokenIn == ETH_ALIAS)
+            revert ZeroAddressNotAllowed();
+
+        // 1. Pull tokenIn from the user into this contract via Permit2.
+        //    User authorized this transfer off-chain via signature.
+        PERMIT2.permitTransferFrom(
+            msg.sender,
+            tokenIn,
+            amountIn,
+            address(this),
+            deadline,
+            v,
+            r,
+            s
+        );
+
+        // 2. Convert to USDC if needed.
+        uint256 usdcReceived;
+        if (tokenIn == address(USDC)) {
+            usdcReceived = amountIn;
+        } else {
+            usdcReceived = _swapExactInputSingle(
+                tokenIn,
+                amountIn,
+                deadline,
+                routerCommands,
+                routerInputs
+            );
+        }
+
+        // 3. Slippage guard for non-USDC tokens.
+        if (tokenIn != address(USDC) && usdcReceived < minUsdcOut) {
+            revert InsufficientSwapOutput(minUsdcOut, usdcReceived);
+        }
+
+        // 4. Enforce vault capacity before credit.
+        _enforceBankCap(usdcReceived);
+
+        // 5. Credit internal ledger.
+        balances[msg.sender] += usdcReceived;
+
+        depositCount++;
+
+        emit DepositedUSDC(msg.sender, tokenIn, amountIn, usdcReceived);
+    }
+
+    // ========= Withdraw / Admin =========
+
+    /**
+     * @notice Withdraw USDC from the user's internal balance.
+     * @dev All internal balances are denominated in USDC.
      */
     function withdrawUsdc(uint256 amountUsdc) external noReentrancy {
         if (amountUsdc == 0) revert ZeroAmountNotAllowed();
@@ -241,53 +448,57 @@ contract KipuBank is AccessControl {
             revert InsufficientBalance(amountUsdc, bal);
         }
 
-        // effects
         balances[msg.sender] = bal - amountUsdc;
         withdrawCount++;
 
-        // interaction
         USDC.safeTransfer(msg.sender, amountUsdc);
 
         emit WithdrawnUSDC(msg.sender, amountUsdc);
     }
 
     /**
-     * @notice Manager can force-set someone's USDC balance.
-     * Mirrors the "recoverFunds" spirit from V2.
+     * @notice Manager override to correct a user's internal USDC balance.
+     * @dev Mirrors KipuBankV2's "recoverFunds" capability.
      */
     function recoverFunds(
         address user,
         uint256 newBalanceUsdc
     ) external onlyRole(MANAGER_ROLE) {
         if (user == address(0)) revert ZeroAddressNotAllowed();
+
         balances[user] = newBalanceUsdc;
+
         emit FundsRecovered(msg.sender, user, newBalanceUsdc);
     }
 
-    // ========= Internal helpers (will be added later) =========
-    // - _pullTokenFromUser(address token, address from, uint256 amount)
-    // - _swapToUSDCIfNeeded(...)
-    // - (optional) _getEthUsdPrice() from Chainlink for legacy compatibility
+    /**
+     * @notice Plain ETH transfers are rejected.
+     * @dev ETH deposits must go through depositArbitraryToken with ETH_ALIAS.
+     */
+    receive() external payable {
+        revert("Use depositArbitraryToken with ETH_ALIAS");
+    }
+
+    // ========= Internal Helpers =========
 
     /**
-     * @dev Reverts if adding `incomingUsdc` would push the vault above BANK_CAP.
-     * We always measure cap in USDC units (6 decimals).
+     * @dev Ensures BANK_CAP (global TVL limit in USDC units) is not exceeded.
+     *      Reverts if current holdings + incomingUsdc > BANK_CAP.
      */
     function _enforceBankCap(uint256 incomingUsdc) internal view {
         uint256 current = USDC.balanceOf(address(this));
         uint256 projected = current + incomingUsdc;
-
         if (projected > BANK_CAP) {
             revert BankCapacityExceeded(current, incomingUsdc, BANK_CAP);
         }
     }
 
     /**
-     * @dev Pulls `amount` of `token` from `from` into this contract.
-     * Uses SafeERC20 for safety. Caller must have approved beforehand.
+     * @dev Pull `amount` of `token` from `from` into this contract.
+     *      User must have approved this contract beforehand (classic ERC20 flow).
      *
-     * NOTE: For final version we may extend this to support Permit2
-     * so the user can sign instead of calling approve().
+     * NOTE: The Permit2-based path (`depositWithPermit2`) avoids this explicit
+     *       approve() step and instead uses a signed permit to authorize transfer.
      */
     function _pullTokenFromUser(
         address token,
@@ -299,73 +510,60 @@ contract KipuBank is AccessControl {
     }
 
     /**
-     * @dev Swaps `amountIn` of `tokenIn` (already held by this contract)
-     *      into USDC using the Universal Router.
+     * @dev Swap `amountIn` of `tokenIn` (already custodied by this contract)
+     *      into USDC via the Universal Router.
      *
-     * The Uniswap V4 routing data is provided via `routerCommands` and
-     * `routerInputs`. These are the encoded "program" that the UniversalRouter
-     * executes. In practice, off-chain code builds these using Uniswap V4 types:
+     * The caller provides:
+     *  - routerCommands: encoded "program" for UniversalRouter. It contains
+     *    byte-level Commands / Actions that instruct the router how to route,
+     *    wrap, and swap. These are typically composed off-chain using Uniswap
+     *    V4 types like PoolKey and Currency.
      *
-     *  - PoolKey: identifies the V4 pool (token0, token1, fee tier, hooks, etc)
-     *  - Currency: wrapper type used by V4 to represent ERC20 / native assets
-     *  - Commands / Actions: byte-level opcodes telling the router which action
-     *    to perform (e.g. swap exact in, sweep token, etc)
+     *  - routerInputs: ABI-encoded per-command arguments consumed by each step
+     *    in `routerCommands`.
      *
-     * The expectation is:
-     *  - UniversalRouter pulls `tokenIn` from this contract,
-     *  - performs a swap along the specified PoolKey(s),
-     *  - and sends the output (USDC) back to this contract.
+     * Execution model:
+     *  1. We do a scoped allowance:
+     *     - reset allowance to 0
+     *     - approve exactly amountIn for the router
+     *  2. UniversalRouter pulls `tokenIn` from this contract.
+     *  3. Router executes the provided route and returns USDC to this contract.
+     *  4. We compute the delta in USDC balance.
      *
-     * Security notes:
-     *  - We approve only `amountIn` to the router and clear allowance first.
-     *  - Caller provides `minUsdcOut` as slippage protection.
-     *  - We do not leave infinite approvals behind.
+     * Security considerations:
+     *  - No infinite approvals left behind.
+     *  - deadline ensures swaps cannot execute under stale market conditions.
      *
-     * Returns how much USDC was actually received.
+     * @return usdcReceived The incremental USDC obtained by this contract.
      */
-
     function _swapExactInputSingle(
         address tokenIn,
         uint256 amountIn,
-        uint256 minUsdcOut,
+        uint256 deadline,
         bytes calldata routerCommands,
         bytes[] calldata routerInputs
     ) internal returns (uint256 usdcReceived) {
-        // snapshot how much USDC we had before
         uint256 balanceBefore = USDC.balanceOf(address(this));
 
-        if (tokenIn == address(USDC)) {
-            // no swap needed, we already hold USDC
-            usdcReceived = amountIn;
-        } else {
-            IERC20 token = IERC20(tokenIn);
+        IERC20 token = IERC20(tokenIn);
 
-            // reset allowance for safety, then approve router
-            // We do manual approve here instead of SafeERC20.safeApprove(),
-            // because newer OZ versions removed safeApprove.
-            require(
-                token.approve(address(UNIVERSAL_ROUTER), 0),
-                "approve reset failed"
-            );
+        // Reset then set allowance for exact amountIn.
+        require(
+            token.approve(address(UNIVERSAL_ROUTER), 0),
+            "approve reset failed"
+        );
+        require(
+            token.approve(address(UNIVERSAL_ROUTER), amountIn),
+            "approve failed"
+        );
 
-            require(
-                token.approve(address(UNIVERSAL_ROUTER), amountIn),
-                "approve failed"
-            );
+        // Router will now:
+        //  - pull tokenIn from this contract,
+        //  - perform the swap(s),
+        //  - send USDC back to this contract.
+        UNIVERSAL_ROUTER.execute(routerCommands, routerInputs, deadline);
 
-            // execute the encoded Uniswap V4 route
-            UNIVERSAL_ROUTER.execute(routerCommands, routerInputs);
-
-            // calculate how much USDC we actually gained
-            uint256 balanceAfter = USDC.balanceOf(address(this));
-            usdcReceived = balanceAfter - balanceBefore;
-        }
-
-        // basic slippage protection: require minimum USDC
-        if (usdcReceived < minUsdcOut) {
-            revert("slippage");
-        }
-
-        return usdcReceived;
+        uint256 balanceAfter = USDC.balanceOf(address(this));
+        usdcReceived = balanceAfter - balanceBefore;
     }
 }
