@@ -7,7 +7,7 @@ import {KipuBank} from "../src/KipuBank.sol";
 contract DeployKipuBank is Script {
     function run() external {
         // load deployer private key from env
-        uint256 pk = vm.envUint("PRIVATE_KEY");
+        uint256 pk = vm.envUint("ADMIN_PRIVATE_KEY");
 
         // config (you ajusta esses valores pra rede alvo)
         address usdc = vm.envAddress("USDC_ADDRESS");
