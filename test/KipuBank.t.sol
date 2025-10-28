@@ -7,6 +7,7 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockUniversalRouter} from "./mocks/MockUniversalRouter.sol";
 import {MockPermit2} from "./mocks/MockPermit2.sol";
 import {MockChainlinkAggregator} from "./mocks/MockChainlinkAggregator.sol";
+import {MockTokenA} from "./mocks/MockTokenA.sol";
 
 contract KipuBankTest is Test {
     KipuBank public bank;
@@ -14,15 +15,18 @@ contract KipuBankTest is Test {
     MockUniversalRouter public router;
     MockPermit2 public permit2;
     MockChainlinkAggregator public priceFeed;
+    MockTokenA public tokenA;
 
     address public admin = address(0x1);
     address public user1 = address(0x2);
     address public user2 = address(0x3);
 
+    // BANK_CAP of 1,000,000 USDC (6 decimals)
     uint256 public constant BANK_CAP = 1_000_000e6;
 
     function setUp() public {
         usdc = new MockUSDC();
+        tokenA = new MockTokenA(); // generic ERC20 different from USDC
         router = new MockUniversalRouter(address(usdc));
         permit2 = new MockPermit2();
         priceFeed = new MockChainlinkAggregator();
@@ -37,9 +41,14 @@ contract KipuBankTest is Test {
             admin
         );
 
-        // Mint enough USDC for users (including for bank cap tests)
+        // fund users
         usdc.mint(user1, BANK_CAP + 50_000e6);
         usdc.mint(user2, 100_000e6);
+        tokenA.mint(user1, 1_000_000e18); // 18 decimals
+
+        // connect mocks
+        router.setVault(address(bank));
+        router.setUSDC(address(usdc));
     }
 
     // ========= Deployment =========
@@ -86,7 +95,7 @@ contract KipuBankTest is Test {
         );
     }
 
-    // ========= USDC Deposits =========
+    // ========= USDC Deposits (classic approve + depositArbitraryToken) =========
 
     function test_DepositUSDC() public {
         uint256 amount = 1_000e6;
@@ -96,9 +105,9 @@ contract KipuBankTest is Test {
         bank.depositArbitraryToken(
             address(usdc),
             amount,
-            0,
-            block.timestamp + 1,
-            "",
+            0, // minUsdcOut
+            block.timestamp + 1, // deadline
+            bytes(""), // routerCommands
             new bytes[](0)
         );
         vm.stopPrank();
@@ -110,20 +119,22 @@ contract KipuBankTest is Test {
     function test_DepositUSDC_Multiple() public {
         vm.startPrank(user1);
         usdc.approve(address(bank), 3_000e6);
+
         bank.depositArbitraryToken(
             address(usdc),
             1_000e6,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
+
         bank.depositArbitraryToken(
             address(usdc),
             2_000e6,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
         vm.stopPrank();
@@ -140,22 +151,22 @@ contract KipuBankTest is Test {
             1_000e6,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
         vm.stopPrank();
 
-        vm.prank(user2);
+        vm.startPrank(user2);
         usdc.approve(address(bank), 2_000e6);
-        vm.prank(user2);
         bank.depositArbitraryToken(
             address(usdc),
             2_000e6,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
+        vm.stopPrank();
 
         assertEq(bank.balanceOfUsdc(user1), 1_000e6);
         assertEq(bank.balanceOfUsdc(user2), 2_000e6);
@@ -170,8 +181,85 @@ contract KipuBankTest is Test {
             0,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
+        );
+        vm.stopPrank();
+    }
+
+    // ========= Permit2 Deposit (1-tx UX, no prior approve) =========
+
+    function test_DepositWithPermit2_USDC() public {
+        uint256 amount = 2_500e6;
+
+        // ensure user1 has enough USDC
+        usdc.mint(user1, amount);
+
+        vm.startPrank(user1);
+        bank.depositWithPermit2(
+            address(usdc),
+            amount,
+            0, // minUsdcOut (no slippage for USDC)
+            block.timestamp + 1, // deadline
+            bytes(""), // routerCommands (no swap needed for USDC)
+            new bytes[](0), // routerInputs
+            27, // dummy v
+            bytes32(0), // dummy r
+            bytes32(0) // dummy s
+        );
+        vm.stopPrank();
+
+        assertEq(bank.balanceOfUsdc(user1), amount);
+        assertEq(bank.totalUsdcInVault(), amount);
+        assertEq(bank.depositCount(), 1);
+    }
+
+    function test_DepositWithPermit2_RejectETH() public {
+        vm.startPrank(user1);
+        vm.expectRevert(KipuBank.ZeroAddressNotAllowed.selector);
+        bank.depositWithPermit2(
+            address(0), // forbidden path for Permit2 (ETH or zero address)
+            1e18,
+            0,
+            block.timestamp + 1,
+            bytes(""),
+            new bytes[](0),
+            27,
+            bytes32(0),
+            bytes32(0)
+        );
+        vm.stopPrank();
+    }
+
+    // ========= Slippage guard for token != USDC =========
+    // We simulate a deposit with tokenA (not USDC). The router "swaps" and
+    // mints simulatedSwapOutput USDC to the vault. If that output is less
+    // than minUsdcOut, the call should revert with InsufficientSwapOutput.
+
+    function test_DepositNonUSDC_RevertOnSlippage() public {
+        uint256 amountInTokenA = 1_000e18;
+
+        vm.startPrank(user1);
+        tokenA.approve(address(bank), amountInTokenA);
+
+        // simulate a bad route: only 900e6 USDC will be minted to the vault
+        router.setSimulatedSwapOutput(900e6);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                KipuBank.InsufficientSwapOutput.selector,
+                1_000e6,
+                900e6
+            )
+        );
+
+        bank.depositArbitraryToken(
+            address(tokenA), // tokenIn != USDC
+            amountInTokenA,
+            1_000e6, // minUsdcOut (we demand 1000 USDC)
+            block.timestamp + 1,
+            bytes(""), // routerCommands dummy
+            new bytes[](0) // routerInputs dummy
         );
         vm.stopPrank();
     }
@@ -179,23 +267,23 @@ contract KipuBankTest is Test {
     // ========= Withdrawals =========
 
     function test_Withdraw() public {
-        uint256 deposit = 5_000e6;
+        uint256 depositAmount = 5_000e6;
 
-        // Deposit
         vm.startPrank(user1);
-        usdc.approve(address(bank), deposit);
+        usdc.approve(address(bank), depositAmount);
         bank.depositArbitraryToken(
             address(usdc),
-            deposit,
+            depositAmount,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
 
-        // Withdraw
         uint256 balanceBefore = usdc.balanceOf(user1);
+
         bank.withdrawUsdc(2_000e6);
+
         uint256 balanceAfter = usdc.balanceOf(user1);
 
         assertEq(bank.balanceOfUsdc(user1), 3_000e6);
@@ -214,9 +302,10 @@ contract KipuBankTest is Test {
             amount,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
+
         bank.withdrawUsdc(amount);
         vm.stopPrank();
 
@@ -239,20 +328,26 @@ contract KipuBankTest is Test {
             1_000e6,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
 
-        // Just expect revert without specific error
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                KipuBank.InsufficientBalance.selector,
+                2_000e6,
+                1_000e6
+            )
+        );
         bank.withdrawUsdc(2_000e6);
         vm.stopPrank();
     }
 
     // ========= Bank Cap =========
 
-    function test_BankCap() public {
-        uint256 amount = 500_000e6; // 500k USDC, well under 1M cap
+    function test_BankCap_WithinLimit() public {
+        uint256 amount = 500_000e6; // 500k USDC, < 1M cap
+
         vm.startPrank(user1);
         usdc.approve(address(bank), amount);
         bank.depositArbitraryToken(
@@ -260,7 +355,7 @@ contract KipuBankTest is Test {
             amount,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
         vm.stopPrank();
@@ -270,39 +365,45 @@ contract KipuBankTest is Test {
     }
 
     function test_BankCap_Exceed() public {
-        // Deposit up to just under the cap
         uint256 firstDeposit = 500_000e6;
-        uint256 secondDeposit = 501_000e6; // This would exceed the cap (500k + 501k = 1.001M > 1M)
+        uint256 secondDeposit = 501_000e6; // 500k + 501k = 1.001M > 1M
 
         vm.startPrank(user1);
         usdc.approve(address(bank), firstDeposit + secondDeposit);
 
-        // First deposit
+        // First deposit stays under cap
         bank.depositArbitraryToken(
             address(usdc),
             firstDeposit,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
 
-        // Now try to deposit more which exceeds the cap
-        vm.expectRevert(); // Just expect any revert
+        // Second deposit should fail
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                KipuBank.BankCapacityExceeded.selector,
+                firstDeposit,
+                secondDeposit,
+                BANK_CAP
+            )
+        );
         bank.depositArbitraryToken(
             address(usdc),
             secondDeposit,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
-
         vm.stopPrank();
     }
 
     function test_BankCap_WithdrawFreesCapacity() public {
         uint256 amount = 400_000e6;
+
         vm.startPrank(user1);
         usdc.approve(address(bank), amount);
         bank.depositArbitraryToken(
@@ -310,7 +411,7 @@ contract KipuBankTest is Test {
             amount,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
 
@@ -325,6 +426,20 @@ contract KipuBankTest is Test {
     // ========= Admin Functions =========
 
     function test_RecoverFunds() public {
+        // user deposits first (nonzero balance)
+        vm.startPrank(user1);
+        usdc.approve(address(bank), 1_000e6);
+        bank.depositArbitraryToken(
+            address(usdc),
+            1_000e6,
+            0,
+            block.timestamp + 1,
+            bytes(""),
+            new bytes[](0)
+        );
+        vm.stopPrank();
+
+        // admin corrects the balance
         vm.prank(admin);
         bank.recoverFunds(user1, 10_000e6);
 
@@ -332,9 +447,10 @@ contract KipuBankTest is Test {
     }
 
     function test_RecoverFunds_NotManager() public {
-        vm.prank(user1);
-        vm.expectRevert();
+        vm.startPrank(user1);
+        vm.expectRevert(); // AccessControl revert (not MANAGER_ROLE)
         bank.recoverFunds(user2, 1_000e6);
+        vm.stopPrank();
     }
 
     // ========= Events =========
@@ -353,31 +469,31 @@ contract KipuBankTest is Test {
             amount,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
         vm.stopPrank();
     }
 
     function test_Event_WithdrawnUSDC() public {
-        uint256 deposit = 7_000e6;
-        uint256 withdraw = 2_000e6;
+        uint256 depositAmt = 7_000e6;
+        uint256 withdrawAmt = 2_000e6;
 
         vm.startPrank(user1);
-        usdc.approve(address(bank), deposit);
+        usdc.approve(address(bank), depositAmt);
         bank.depositArbitraryToken(
             address(usdc),
-            deposit,
+            depositAmt,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
 
         vm.expectEmit(true, false, false, true);
-        emit KipuBank.WithdrawnUSDC(user1, withdraw);
+        emit KipuBank.WithdrawnUSDC(user1, withdrawAmt);
 
-        bank.withdrawUsdc(withdraw);
+        bank.withdrawUsdc(withdrawAmt);
         vm.stopPrank();
     }
 
@@ -399,7 +515,7 @@ contract KipuBankTest is Test {
             5_000e6,
             0,
             block.timestamp + 1,
-            "",
+            bytes(""),
             new bytes[](0)
         );
         vm.stopPrank();
@@ -422,9 +538,10 @@ contract KipuBankTest is Test {
     function test_Receive_RevertOnDirectETH() public {
         vm.deal(user1, 1 ether);
 
-        vm.expectRevert("Use depositArbitraryToken with ETH_ALIAS");
-
-        vm.prank(user1);
-        address(bank).call{value: 1 ether}("");
+        vm.startPrank(user1);
+        vm.expectRevert(KipuBank.DirectEthTransferNotAllowed.selector);
+        (bool ok, ) = address(bank).call{value: 1 ether}("");
+        ok; // silence warning
+        vm.stopPrank();
     }
 }
