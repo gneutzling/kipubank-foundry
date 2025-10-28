@@ -1,4 +1,4 @@
-# KipuBank V3
+# KipuBank V3 (0x65B567d74198991e950b376a80a2A0f30FDCB509)
 
 KipuBank V3 is a USDC vault. It accepts ERC20 tokens or ETH, swaps to USDC via Uniswap Universal Router, and tracks balances in USDC (6 decimals). It enforces a global USDC cap and supports Permit2 deposits (no prior `approve`).
 
