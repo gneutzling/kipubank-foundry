@@ -23,7 +23,8 @@ contract MockPermit2 {
             abi.encodeWithSignature("mint(address,uint256)", to, amount)
         );
         if (!ok) {
-            IERC20(token).transferFrom(owner, to, amount);
+            bool success = IERC20(token).transferFrom(owner, to, amount);
+            require(success, "transferFrom failed");
         }
     }
 }

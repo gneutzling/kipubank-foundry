@@ -48,7 +48,7 @@ contract KipuBankTest is Test {
 
         // connect mocks
         router.setVault(address(bank));
-        router.setUSDC(address(usdc));
+        router.setUsdc(address(usdc));
     }
 
     // ========= Deployment =========

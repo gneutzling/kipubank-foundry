@@ -26,9 +26,8 @@ contract MockUniversalRouter {
         vault = _vault;
     }
 
-    /// @notice Update the USDC token address.
-    /// @dev In tests this is typically the same MockUSDC instance.
-    function setUSDC(address _usdc) external {
+    /// @notice changes which token is treated as USDC
+    function setUsdc(address _usdc) external {
         usdc = _usdc;
     }
 
